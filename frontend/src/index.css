@@ -1,0 +1,79 @@
+:root {
+  --bg-color: #030305;
+  --card-bg: rgba(255, 255, 255, 0.03);
+  --card-border: rgba(255, 255, 255, 0.05);
+  --primary: #00f2ea;
+  --primary-dim: rgba(0, 242, 234, 0.1);
+  --secondary: #ff0055;
+  --accent: #7000ff;
+  --text-main: #ffffff;
+  --text-muted: #8892b0;
+  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --glow-shadow: 0 0 20px rgba(0, 242, 234, 0.3);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-color);
+  color: var(--text-main);
+  font-family: var(--font-family);
+  overflow-x: hidden;
+  min-height: 100vh;
+}
+
+/* Background Animation */
+body::before {
+  content: '';
+  position: fixed;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: radial-gradient(circle at center, rgba(112, 0, 255, 0.05) 0%, rgba(0, 0, 0, 0) 50%),
+    radial-gradient(circle at 80% 20%, rgba(0, 242, 234, 0.05) 0%, rgba(0, 0, 0, 0) 40%);
+  animation: rotateBackground 30s linear infinite;
+  z-index: -1;
+  pointer-events: none;
+}
+
+@keyframes rotateBackground {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--primary);
+}
