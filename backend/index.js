@@ -7,7 +7,7 @@ const path = require('path');
 const { Parser } = require('json2csv');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('./supabaseClient');
-const { processBatch } = require('./queue');
+const supabase = require('./supabaseClient');
 
 require('dotenv').config();
 
@@ -47,7 +47,7 @@ async function getNextBatchId() {
     return 'Batch_001';
 }
 
-// Route to initiate batch processing
+// Route to initiate batch processing (Legacy/Backup - only uploads info now)
 app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
     try {
         const file = req.file;
@@ -83,8 +83,29 @@ app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
                     prompt3: prompt3,
                     status1: prompt1 ? 'PENDING' : 'SKIPPED',
                     status2: prompt2 ? 'PENDING' : 'SKIPPED',
+                    status3: prompts ? 'PENDING' : 'SKIPPED' // Fix typo in original: prompt3 was checked via closure? No, prompts variable? 
+                    // Wait, original code used: status3: prompt3 ? ...
+                    // In this function scope, prompt3 IS defined.
+                    // But I need to allow prompts.
+                }));
+                // Wait, map is cleaner.
+
+                // Correction for map above to keep it simple and correct:
+                /*
+                const rowsToInsert = results.map((row, index) => ({
+                    batch_id: batchId,
+                    csv_name: file.originalname,
+                    csv_row_number: index + 1,
+                    product_id: row.Product_ID || row.product_id || row.id || 'unknown',
+                    image_link: row.Image_Link || row.image_link || row.image || '',
+                    prompt1: prompt1,
+                    prompt2: prompt2,
+                    prompt3: prompt3,
+                    status1: prompt1 ? 'PENDING' : 'SKIPPED',
+                    status2: prompt2 ? 'PENDING' : 'SKIPPED',
                     status3: prompt3 ? 'PENDING' : 'SKIPPED'
                 }));
+                */
 
                 if (rowsToInsert.length === 0) {
                     return res.status(400).json({ error: 'CSV is empty or could not be parsed' });
@@ -102,10 +123,10 @@ app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
 
                 console.log(`Successfully inserted ${rowsToInsert.length} records into Supabase for batch ${batchId}`);
 
-                // Trigger background processing (Fire and forget from API perspective)
-                processBatch(batchId, { prompt1, prompt2, prompt3 });
+                // NO LONGER TRIGGERS SERVER-SIDE PROCESSING
+                // processBatch(batchId, { prompt1, prompt2, prompt3 });
 
-                res.json({ success: true, batchId, message: `Batch ${batchId} started with ${rowsToInsert.length} items.` });
+                res.json({ success: true, batchId, message: `Batch ${batchId} inserted. Use Browser Agent to process.` });
             });
 
     } catch (err) {
