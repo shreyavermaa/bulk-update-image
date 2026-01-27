@@ -30,16 +30,33 @@ async function processBatch(batchId, prompts) {
 
     console.log(`Found ${items.length} items to process.`);
 
-    try {
-        // Process items with limited concurrency
-        const chunks = [];
-        for (let i = 0; i < items.length; i += BATCH_CONCURRENCY) {
-            chunks.push(items.slice(i, i + BATCH_CONCURRENCY));
-        }
+    // Flatten all tasks into a single array
+    const allTasks = [];
+    for (const item of items) {
+        if (prompts.prompt1) allTasks.push({ item, variantNum: 1, promptText: prompts.prompt1 });
+        if (prompts.prompt2) allTasks.push({ item, variantNum: 2, promptText: prompts.prompt2 });
+        if (prompts.prompt3) allTasks.push({ item, variantNum: 3, promptText: prompts.prompt3 });
+    }
 
-        for (const chunk of chunks) {
-            console.log(`Processing chunk of ${chunk.length} items...`);
-            await Promise.all(chunk.map(item => processItem(item, prompts)));
+    console.log(`Total tasks to process: ${allTasks.length}`);
+
+    // Process tasks in chunks of 3 with 30s delay
+    const CHUNK_SIZE = 3;
+    const DELAY_MS = 30000; // 30 seconds
+
+    try {
+        for (let i = 0; i < allTasks.length; i += CHUNK_SIZE) {
+            const chunk = allTasks.slice(i, i + CHUNK_SIZE);
+            console.log(`Processing chunk ${Math.ceil((i + 1) / CHUNK_SIZE)}/${Math.ceil(allTasks.length / CHUNK_SIZE)} (${chunk.length} tasks)...`);
+
+            // Run chunk in parallel
+            await Promise.all(chunk.map(task => generateVariantWithRetry(task.item, task.variantNum, task.promptText)));
+
+            // Wait 30 seconds if there are more tasks remaining
+            if (i + CHUNK_SIZE < allTasks.length) {
+                console.log(`Waiting ${DELAY_MS / 1000} seconds before next chunk...`);
+                await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+            }
         }
     } catch (err) {
         if (err instanceof CriticalError) {
@@ -52,15 +69,7 @@ async function processBatch(batchId, prompts) {
     console.log(`Batch ${batchId} processing execution finished.`);
 }
 
-async function processItem(item, prompts) {
-    // Run all requested prompts in parallel for this item
-    const tasks = [];
-    if (prompts.prompt1) tasks.push(generateVariantWithRetry(item, 1, prompts.prompt1));
-    if (prompts.prompt2) tasks.push(generateVariantWithRetry(item, 2, prompts.prompt2));
-    if (prompts.prompt3) tasks.push(generateVariantWithRetry(item, 3, prompts.prompt3));
-
-    await Promise.all(tasks);
-}
+// Helper processItem removed as we process by individual tasks now
 
 async function generateVariantWithRetry(item, variantNum, promptText) {
     const statusField = `status${variantNum}`;
