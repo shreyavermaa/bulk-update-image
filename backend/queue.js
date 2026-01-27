@@ -2,7 +2,7 @@ const axios = require('axios');
 const supabase = require('./supabaseClient');
 
 const N8N_WEBHOOK = 'https://n8n.srv1163673.hstgr.cloud/webhook/image-variant';
-const MAX_RETRIES = 5;
+const MAX_RETRIES = 3;
 
 class CriticalError extends Error {
     constructor(message) {
@@ -40,9 +40,9 @@ async function processBatch(batchId, prompts) {
 
     console.log(`Total tasks to process: ${allTasks.length}`);
 
-    // Process tasks in chunks of 3 with 30s delay
-    const CHUNK_SIZE = 3;
-    const DELAY_MS = 30000; // 30 seconds
+    // Process tasks in chunks of 1 with 10s delay
+    const CHUNK_SIZE = 1;
+    const DELAY_MS = 10000; // 10 seconds
 
     try {
         for (let i = 0; i < allTasks.length; i += CHUNK_SIZE) {
@@ -114,8 +114,9 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
                     [errorField]: `Failed after ${MAX_RETRIES} attempts: ${err.message}`
                 }).eq('id', item.id);
 
-                // STOP ALL OPERATION
-                throw new CriticalError(`Stopping all operations. Failed ${item.product_id} after ${MAX_RETRIES} retries.`);
+                // STOP ALL OPERATION - CHANGED: Continue to next request
+                console.error(`Failed ${item.product_id} after ${MAX_RETRIES} retries. Moving to next request.`);
+                return; // Exit function, allowing processBatch to continue
             }
 
             // Wait before retry (exponential backoff or fixed?)
