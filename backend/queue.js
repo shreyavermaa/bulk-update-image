@@ -71,7 +71,7 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
     // Format: BatchID_ProductID_VarN_Timestamp
     // Sanitize product_id to be safe for filenames (alphanumeric + dashes/underscores)
     const safeProductId = (item.product_id || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '');
-    const uniqueName = `${item.batch_id}_${safeProductId}_var${variantNum}_${Date.now()}`;
+    const uniqueName = `${safeProductId}-${variantNum}`;
 
     // Update status to PROCESSING and save the intended path immediately (or on success? User said "save that")
     // Let's save it immediately so we have a record of what was sent.
