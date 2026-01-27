@@ -43,7 +43,8 @@ const UploadSection = ({ onBatchStarted }) => {
         formData.append('prompt3', prompts.prompt3);
 
         try {
-            const res = await axios.post('http://localhost:5000/api/initiate-batch', formData, {
+            const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+            const res = await axios.post(`${backendUrl}/api/initiate-batch`, formData, {
                 headers: { 'Content-Type': 'multipart/form-data' }
             });
             if (res.data.success) {

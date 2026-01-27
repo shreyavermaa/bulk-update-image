@@ -12,7 +12,8 @@ const BatchHistory = ({ onViewBatch }) => {
 
     const fetchBatches = async () => {
         try {
-            const response = await fetch('http://localhost:5000/api/batches');
+            const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+            const response = await fetch(`${backendUrl}/api/batches`);
             if (!response.ok) {
                 throw new Error('Failed to fetch batches');
             }
@@ -28,7 +29,8 @@ const BatchHistory = ({ onViewBatch }) => {
     const handleDownload = async (batchId) => {
         try {
             // Trigger download
-            window.location.href = `http://localhost:5000/api/download-batch/${batchId}`;
+            const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+            window.location.href = `${backendUrl}/api/download-batch/${batchId}`;
         } catch (err) {
             console.error("Download failed", err);
             alert("Failed to download CSV");
@@ -38,7 +40,8 @@ const BatchHistory = ({ onViewBatch }) => {
     const handleDownloadZip = async (batchId) => {
         try {
             // Trigger download
-            window.location.href = `http://localhost:5000/api/download-images/${batchId}`;
+            const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+            window.location.href = `${backendUrl}/api/download-images/${batchId}`;
         } catch (err) {
             console.error("Download failed", err);
             alert("Failed to download ZIP");
