@@ -115,40 +115,35 @@ app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
 });
 
 
-// NEW ROUTE: Process Single Item (Browser Driven)
-const { processProductItem } = require('./queue');
+// Route to get a new Batch ID for the browser
+app.get('/api/new-batch-id', async (req, res) => {
+    const id = await getNextBatchId();
+    res.json({ batchId: id });
+});
 
-app.post('/api/process-item', async (req, res) => {
+// DB LOGGING ENDPOINTS (Frontend Driven)
+
+app.post('/api/db/start-item', async (req, res) => {
     try {
-        const { batchId, csvRowNumber, productData, prompts } = req.body;
+        const { batchId, csvRowNumber, productData, prompts, uniqueName, variantNum } = req.body;
         // productData = { Product_ID, Image_Link, ... }
 
-        // Sanitize
         const productId = productData.Product_ID || productData.product_id || productData.id || 'unknown';
         const imageLink = productData.Image_Link || productData.image_link || productData.image || '';
 
-        // Check if already exists? Or just insert.
-        // Let's insert blindly. Unique constraint (batch_id, product_id) usually prevents dups but we might not have it.
-        // Or update if exists?
+        // Upsert logic: ensure row exists
+        // We use upsert on (batch_id, product_id) usually, but here we might just insert if not exists.
+        // Simplified: Check if exists, if not insert. Then update status.
 
-        let itemData;
-
-        // Try to select existing first to avoid duplicates if re-run
-        const { data: existing } = await supabase
+        // 1. Ensure Row Exists
+        let { data: row, error: fetchError } = await supabase
             .from('product_generations')
-            .select('*')
+            .select('id')
             .eq('batch_id', batchId)
             .eq('product_id', productId)
             .maybeSingle();
 
-        if (existing) {
-            itemData = existing;
-            // Maybe it failed before? Reset prompts?
-            // Actually, if it's already COMPLETED, maybe skip?
-            // But user might want to re-run.
-            // Let's assume re-run.
-        } else {
-            // Insert new
+        if (!row) {
             const { data: inserted, error: insertError } = await supabase
                 .from('product_generations')
                 .insert([{
@@ -166,28 +161,71 @@ app.post('/api/process-item', async (req, res) => {
                 }])
                 .select()
                 .single();
-
             if (insertError) throw insertError;
-            itemData = inserted;
+            row = inserted;
         }
 
-        console.log(`Processing single item ${productId} for batch ${batchId}...`);
+        // 2. Update Status to PROCESSING
+        const statusField = `status${variantNum}`;
+        const pathField = `image${variantNum}_path`;
 
-        // This will wait until all 3 prompts are done (or failed)
-        await processProductItem(itemData, prompts);
+        const { error: updateError } = await supabase
+            .from('product_generations')
+            .update({
+                [statusField]: 'PROCESSING',
+                [pathField]: uniqueName
+            })
+            .eq('id', row.id);
 
-        res.json({ success: true, productId });
+        if (updateError) throw updateError;
 
+        res.json({ success: true, id: row.id });
     } catch (err) {
-        console.error('Single item process error:', err);
+        console.error('DB Start Error:', err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// Also need a route to get a new Batch ID for the browser
-app.get('/api/new-batch-id', async (req, res) => {
-    const id = await getNextBatchId();
-    res.json({ batchId: id });
+app.post('/api/db/complete-item', async (req, res) => {
+    try {
+        const { batchId, productId, variantNum } = req.body;
+        const statusField = `status${variantNum}`;
+
+        const { error } = await supabase
+            .from('product_generations')
+            .update({ [statusField]: 'COMPLETED' })
+            .eq('batch_id', batchId)
+            .eq('product_id', productId);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DB Complete Error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/db/fail-item', async (req, res) => {
+    try {
+        const { batchId, productId, variantNum, errorMessage } = req.body;
+        const statusField = `status${variantNum}`;
+        const errorField = `error${variantNum}`;
+
+        const { error } = await supabase
+            .from('product_generations')
+            .update({
+                [statusField]: 'FAILED',
+                [errorField]: errorMessage
+            })
+            .eq('batch_id', batchId)
+            .eq('product_id', productId);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        console.error('DB Fail Error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // Route to get batch status

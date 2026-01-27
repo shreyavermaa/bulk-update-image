@@ -19,6 +19,8 @@ const UploadSection = ({ onBatchStarted }) => {
     const [stats, setStats] = useState({ success: 0, failed: 0, skipped: 0 });
     const [logs, setLogs] = useState([]);
     const [isPaused, setIsPaused] = useState(false);
+    const [waitTimer, setWaitTimer] = useState(0);
+    const [activeItem, setActiveItem] = useState(null); // { id: '...', variant: 1 }
 
     // Auto-scroll logs
     const logsEndRef = useRef(null);
@@ -27,7 +29,23 @@ const UploadSection = ({ onBatchStarted }) => {
     }, [logs]);
 
     const addLog = (msg) => {
-        setLogs(prev => [...prev.slice(-4), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+        setLogs(prev => [...prev.slice(-6), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    };
+
+    const waitWithCountdown = (seconds) => {
+        return new Promise(resolve => {
+            setWaitTimer(seconds);
+            const interval = setInterval(() => {
+                setWaitTimer(prev => {
+                    if (prev <= 1) {
+                        clearInterval(interval);
+                        resolve();
+                        return 0;
+                    }
+                    return prev - 1;
+                });
+            }, 1000);
+        });
     };
 
     const handleDrag = (e) => {
@@ -93,54 +111,98 @@ const UploadSection = ({ onBatchStarted }) => {
     const processLoop = async (data, bId, index) => {
         if (index >= data.length) {
             setMode('done');
+            setActiveItem(null);
             addLog('All items command completed.');
-            if (onBatchStarted) onBatchStarted(bId); // Refresh parent list
+            if (onBatchStarted) onBatchStarted(bId);
             return;
         }
 
         if (isPaused) {
             addLog('Paused. Waiting to resume...');
-            // Simple poll or restart needed. Ideally state handles this but recursing makes it tricky.
-            // For now, let's not support Pause/Resume mid-loop easily without effects. 
-            // Actually, we can just return and let user click "Resume" which calls processLoop again.
             return;
         }
 
         const item = data[index];
         setCurrentIndex(index);
-        addLog(`Processing item ${index + 1}/${data.length}: ${item.Product_ID || 'Unknown Type'}`);
+        // addLog(`Processing item ${index + 1}/${data.length}: ${item.Product_ID || 'Unknown Type'}`);
 
         try {
             const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+            const n8nUrl = 'https://n8n.srv1163673.hstgr.cloud/webhook/image-variant'; // Hardcoded for now
 
-            // Send Request
-            await axios.post(`${backendUrl}/api/process-item`, {
-                batchId: bId,
-                csvRowNumber: index + 1,
-                productData: item,
-                prompts: prompts
-            });
+            // Function to process a single prompt variant
+            const processVariant = async (variantNum, promptText) => {
+                if (!promptText) return; // Skip if empty
+
+                const safeProductId = (item.Product_ID || item.product_id || item.id || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '');
+                const uniqueName = `${safeProductId}-${variantNum}`;
+
+                setActiveItem({ id: safeProductId, variant: variantNum, status: 'STARTING' });
+                addLog(`[${safeProductId}] Starting Var ${variantNum}...`);
+
+                // 1. Log START to Backend
+                await axios.post(`${backendUrl}/api/db/start-item`, {
+                    batchId: bId,
+                    csvRowNumber: index + 1,
+                    productData: item,
+                    prompts: prompts,
+                    uniqueName: uniqueName,
+                    variantNum: variantNum
+                });
+
+                // 2. Call n8n Directly
+                // Note: user requested "productData" sent? 
+                // queue.js logic was: image, ProductName, prompt, timestamp
+                const payload = {
+                    image: item.Image_Link || item.image_link || '',
+                    ProductName: uniqueName,
+                    prompt: promptText,
+                    timestamp: uniqueName
+                };
+
+                setActiveItem({ id: safeProductId, variant: variantNum, status: 'SENDING TO AI' });
+                addLog(`[${safeProductId}] Sending to n8n...`);
+                const n8nRes = await axios.post(n8nUrl, payload);
+
+                if (n8nRes.data && n8nRes.data.success) {
+                    // 3. Log COMPLETE to Backend
+                    setActiveItem({ id: safeProductId, variant: variantNum, status: 'SAVING' });
+                    await axios.post(`${backendUrl}/api/db/complete-item`, {
+                        batchId: bId,
+                        productId: safeProductId, // backend expects product_id used in DB
+                        variantNum: variantNum
+                    });
+                    addLog(`[${safeProductId}] Var ${variantNum} COMPLETED.`);
+                } else {
+                    throw new Error(`n8n response not success: ${JSON.stringify(n8nRes.data)}`);
+                }
+            };
+
+            // Run variants sequentially
+            if (prompts.prompt1) await processVariant(1, prompts.prompt1);
+            if (prompts.prompt2) await processVariant(2, prompts.prompt2);
+            if (prompts.prompt3) await processVariant(3, prompts.prompt3);
 
             setStats(prev => ({ ...prev, success: prev.success + 1 }));
-            addLog(`Success. Waiting 5s...`);
+            setActiveItem(null);
 
-            // Standard Delay
-            setTimeout(() => {
-                processLoop(data, bId, index + 1);
-            }, 5000);
+            // Standard Delay 60s for EACH request as requested
+            addLog(`Item Done. Cooling down for 60s...`);
+            await waitWithCountdown(60);
+            processLoop(data, bId, index + 1);
 
         } catch (err) {
             console.error(err);
             setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-            addLog(`Error: ${err.message || 'Timeout/Fail'}. Waiting 60s...`);
+
+            const errMsg = err.response ? `API Error ${err.response.status}` : err.message;
+            addLog(`Error: ${errMsg}. Waiting 60s to retry...`);
+            setActiveItem({ id: 'ERROR', variant: '-', status: 'RETRYING' });
 
             // Error Delay (Smart Backoff)
-            setTimeout(() => {
-                addLog(`Retrying item ${index + 1}...`); // Or skip?
-                // User said "retry it after sometime".
-                // Let's retry the SAME item.
-                processLoop(data, bId, index);
-            }, 60000);
+            await waitWithCountdown(60);
+            addLog(`Retrying item ${index + 1}...`);
+            processLoop(data, bId, index);
         }
     };
 
@@ -167,8 +229,30 @@ const UploadSection = ({ onBatchStarted }) => {
                     <span>Status: {mode === 'done' ? 'COMPLETED' : 'ACTIVE'}</span>
                 </div>
 
+                {/* Active Item Display */}
+                {activeItem && (
+                    <div style={{ marginBottom: '2rem', padding: '1rem', background: 'rgba(56, 189, 248, 0.1)', border: '1px solid rgba(56, 189, 248, 0.3)', borderRadius: '8px' }}>
+                        <div style={{ color: '#38bdf8', fontSize: '0.8rem', fontWeight: 'bold', marginBottom: '0.5rem' }}>CURRENTLY PROCESSING</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                            <div style={{ fontSize: '1.2rem', color: '#fff' }}>Best-ID: {activeItem.id}</div>
+                            <div style={{ padding: '0.2rem 0.6rem', background: '#38bdf8', color: '#000', borderRadius: '4px', fontSize: '0.8rem', fontWeight: 'bold' }}>
+                                VARIATION {activeItem.variant}
+                            </div>
+                            <div style={{ marginLeft: 'auto', color: '#ccc' }}>{activeItem.status}...</div>
+                        </div>
+                    </div>
+                )}
+
+                {/* Wait Timer Display */}
+                {waitTimer > 0 && (
+                    <div style={{ marginBottom: '2rem', padding: '1rem', background: 'rgba(255, 255, 255, 0.05)', border: '1px dashed rgba(255, 255, 255, 0.3)', borderRadius: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                        <span style={{ color: '#aaa', marginRight: '1rem' }}>COOLDOWN / RATE LIMIT PAUSE:</span>
+                        <span style={{ fontSize: '1.5rem', fontWeight: 'bold', color: '#fff' }}>{waitTimer}s</span>
+                    </div>
+                )}
+
                 {/* Stats Grid */}
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
                     <div style={{ background: 'rgba(0,255,0,0.1)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(0,255,0,0.3)' }}>
                         <div style={{ fontSize: '2rem', color: '#4ade80' }}>{stats.success}</div>
                         <div style={{ fontSize: '0.8rem', color: '#aaa' }}>SUCCESS</div>
@@ -176,10 +260,6 @@ const UploadSection = ({ onBatchStarted }) => {
                     <div style={{ background: 'rgba(255,0,0,0.1)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,0,0,0.3)' }}>
                         <div style={{ fontSize: '2rem', color: '#f87171' }}>{stats.failed}</div>
                         <div style={{ fontSize: '0.8rem', color: '#aaa' }}>RETRIES</div>
-                    </div>
-                    <div style={{ background: 'rgba(255,255,255,0.05)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)' }}>
-                        <div style={{ fontSize: '2rem', color: '#fff' }}>60s</div>
-                        <div style={{ fontSize: '0.8rem', color: '#aaa' }}>BACKOFF DELAY</div>
                     </div>
                 </div>
 
