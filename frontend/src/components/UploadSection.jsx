@@ -1,14 +1,34 @@
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
+import Papa from 'papaparse';
 
 const UploadSection = ({ onBatchStarted }) => {
+    // Mode: 'config' | 'processing' | 'done'
+    const [mode, setMode] = useState('config');
     const [file, setFile] = useState(null);
     const [prompts, setPrompts] = useState({ prompt1: '', prompt2: '', prompt3: '' });
-    const [loading, setLoading] = useState(false);
     const [dragActive, setDragActive] = useState(false);
     const fileInputRef = useRef(null);
+
+    // Processing State
+    const [batchId, setBatchId] = useState(null);
+    const [csvData, setCsvData] = useState([]);
+    const [currentIndex, setCurrentIndex] = useState(0);
+    const [stats, setStats] = useState({ success: 0, failed: 0, skipped: 0 });
+    const [logs, setLogs] = useState([]);
+    const [isPaused, setIsPaused] = useState(false);
+
+    // Auto-scroll logs
+    const logsEndRef = useRef(null);
+    useEffect(() => {
+        logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [logs]);
+
+    const addLog = (msg) => {
+        setLogs(prev => [...prev.slice(-4), `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    };
 
     const handleDrag = (e) => {
         e.preventDefault();
@@ -32,31 +52,159 @@ const UploadSection = ({ onBatchStarted }) => {
         }
     };
 
-    const handleInitiate = async () => {
+    const startProcessing = async () => {
         if (!file) return;
 
-        setLoading(true);
-        const formData = new FormData();
-        formData.append('file', file);
-        formData.append('prompt1', prompts.prompt1);
-        formData.append('prompt2', prompts.prompt2);
-        formData.append('prompt3', prompts.prompt3);
+        // 1. Parse CSV
+        Papa.parse(file, {
+            header: true,
+            skipEmptyLines: true,
+            complete: async (results) => {
+                if (results.data.length === 0) {
+                    alert('CSV is empty');
+                    return;
+                }
+                setCsvData(results.data);
+
+                // 2. Get Batch ID
+                try {
+                    const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+                    const res = await axios.get(`${backendUrl}/api/new-batch-id`);
+                    const newBatchId = res.data.batchId;
+                    setBatchId(newBatchId);
+                    setMode('processing');
+                    addLog(`Initialized Batch: ${newBatchId}`);
+                    addLog(`Loaded ${results.data.length} items from CSV`);
+
+                    // Start Loop
+                    processLoop(results.data, newBatchId, 0);
+
+                } catch (err) {
+                    console.error(err);
+                    alert('Failed to connect to backend');
+                }
+            },
+            error: (err) => {
+                alert('Failed to parse CSV: ' + err.message);
+            }
+        });
+    };
+
+    const processLoop = async (data, bId, index) => {
+        if (index >= data.length) {
+            setMode('done');
+            addLog('All items command completed.');
+            if (onBatchStarted) onBatchStarted(bId); // Refresh parent list
+            return;
+        }
+
+        if (isPaused) {
+            addLog('Paused. Waiting to resume...');
+            // Simple poll or restart needed. Ideally state handles this but recursing makes it tricky.
+            // For now, let's not support Pause/Resume mid-loop easily without effects. 
+            // Actually, we can just return and let user click "Resume" which calls processLoop again.
+            return;
+        }
+
+        const item = data[index];
+        setCurrentIndex(index);
+        addLog(`Processing item ${index + 1}/${data.length}: ${item.Product_ID || 'Unknown Type'}`);
 
         try {
             const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-            const res = await axios.post(`${backendUrl}/api/initiate-batch`, formData, {
-                headers: { 'Content-Type': 'multipart/form-data' }
+
+            // Send Request
+            await axios.post(`${backendUrl}/api/process-item`, {
+                batchId: bId,
+                csvRowNumber: index + 1,
+                productData: item,
+                prompts: prompts
             });
-            if (res.data.success) {
-                onBatchStarted(res.data.batchId);
-            }
+
+            setStats(prev => ({ ...prev, success: prev.success + 1 }));
+            addLog(`Success. Waiting 5s...`);
+
+            // Standard Delay
+            setTimeout(() => {
+                processLoop(data, bId, index + 1);
+            }, 5000);
+
         } catch (err) {
             console.error(err);
-            alert('Initialization Failed: Connection lost or server error.');
-        } finally {
-            setLoading(false);
+            setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+            addLog(`Error: ${err.message || 'Timeout/Fail'}. Waiting 60s...`);
+
+            // Error Delay (Smart Backoff)
+            setTimeout(() => {
+                addLog(`Retrying item ${index + 1}...`); // Or skip?
+                // User said "retry it after sometime".
+                // Let's retry the SAME item.
+                processLoop(data, bId, index);
+            }, 60000);
         }
     };
+
+    if (mode !== 'config') {
+        // Processing Dashboard UI
+        const percent = Math.round((currentIndex / csvData.length) * 100);
+
+        return (
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="glass-panel">
+                <h2 style={{ color: '#fff', marginBottom: '1rem' }}>
+                    <span style={{ color: 'var(--primary)' }}>//</span> BATCH EXECUTION: {batchId}
+                </h2>
+
+                {/* Progress Bar */}
+                <div style={{ background: '#333', height: '10px', borderRadius: '5px', overflow: 'hidden', marginBottom: '1rem' }}>
+                    <motion.div
+                        initial={{ width: 0 }}
+                        animate={{ width: `${percent}%` }}
+                        style={{ height: '100%', background: 'var(--primary)' }}
+                    />
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: '#aaa', fontSize: '0.9rem', marginBottom: '2rem' }}>
+                    <span>Progress: {percent}% ({currentIndex}/{csvData.length})</span>
+                    <span>Status: {mode === 'done' ? 'COMPLETED' : 'ACTIVE'}</span>
+                </div>
+
+                {/* Stats Grid */}
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '1rem', marginBottom: '2rem' }}>
+                    <div style={{ background: 'rgba(0,255,0,0.1)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(0,255,0,0.3)' }}>
+                        <div style={{ fontSize: '2rem', color: '#4ade80' }}>{stats.success}</div>
+                        <div style={{ fontSize: '0.8rem', color: '#aaa' }}>SUCCESS</div>
+                    </div>
+                    <div style={{ background: 'rgba(255,0,0,0.1)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,0,0,0.3)' }}>
+                        <div style={{ fontSize: '2rem', color: '#f87171' }}>{stats.failed}</div>
+                        <div style={{ fontSize: '0.8rem', color: '#aaa' }}>RETRIES</div>
+                    </div>
+                    <div style={{ background: 'rgba(255,255,255,0.05)', padding: '1rem', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.1)' }}>
+                        <div style={{ fontSize: '2rem', color: '#fff' }}>60s</div>
+                        <div style={{ fontSize: '0.8rem', color: '#aaa' }}>BACKOFF DELAY</div>
+                    </div>
+                </div>
+
+                {/* Logs Terminal */}
+                <div style={{ background: '#000', padding: '1rem', borderRadius: '8px', fontFamily: 'monospace', height: '150px', overflowY: 'auto', border: '1px solid #333' }}>
+                    {logs.map((log, i) => (
+                        <div key={i} style={{ color: log.includes('Error') ? '#f87171' : '#ccc', marginBottom: '4px', fontSize: '0.85rem' }}>
+                            {log}
+                        </div>
+                    ))}
+                    <div ref={logsEndRef} />
+                </div>
+
+                {mode === 'done' && (
+                    <button
+                        className="cyber-btn"
+                        style={{ marginTop: '2rem', width: '100%' }}
+                        onClick={() => { setMode('config'); setFile(null); setLogs([]); setStats({ success: 0, failed: 0, skipped: 0 }); setCurrentIndex(0); }}
+                    >
+                        START NEW BATCH
+                    </button>
+                )}
+            </motion.div>
+        );
+    }
 
     return (
         <motion.div
@@ -145,14 +293,12 @@ const UploadSection = ({ onBatchStarted }) => {
                     <motion.div style={{ marginTop: '2rem' }}>
                         <button
                             className="cyber-btn"
-                            onClick={handleInitiate}
-                            disabled={loading || !file}
+                            onClick={startProcessing}
+                            disabled={!file}
                         >
-                            {loading ? (
-                                <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px' }}>
-                                    INITIALIZING <span className="loader"></span>
-                                </span>
-                            ) : 'EXECUTE BATCH SEQUENCE'}
+                            <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px' }}>
+                                EXECUTE BROWSER AGENT
+                            </span>
                         </button>
                     </motion.div>
                 </div>

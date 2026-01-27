@@ -11,65 +11,23 @@ class CriticalError extends Error {
     }
 }
 
-// Concurrency configuration
-const BATCH_CONCURRENCY = 5; // Process 5 products at once
+// Export the single item processor
+// New Logic: The frontend controls the loop. This function processes ONE product (up to 3 prompts).
+// It returns a Promise that resolves when all prompts for this item are handled.
+async function processProductItem(item, prompts) {
+    const tasks = [];
+    if (prompts.prompt1) tasks.push(generateVariantWithRetry(item, 1, prompts.prompt1));
+    if (prompts.prompt2) tasks.push(generateVariantWithRetry(item, 2, prompts.prompt2));
+    if (prompts.prompt3) tasks.push(generateVariantWithRetry(item, 3, prompts.prompt3));
 
-async function processBatch(batchId, prompts) {
-    console.log(`Starting processing for batch: ${batchId}`);
-
-    // Fetch all items for this batch
-    const { data: items, error } = await supabase
-        .from('product_generations')
-        .select('*')
-        .eq('batch_id', batchId);
-
-    if (error) {
-        console.error('Error fetching batch items:', error);
-        return;
+    // Run these 3 sequentially or parallel? 
+    // User wants "1 request at a time" to avoid vertex limits.
+    // If we run these parallel, it's 3 requests. 
+    // To be safe, let's run them sequentially.
+    for (const task of tasks) {
+        await task;
     }
-
-    console.log(`Found ${items.length} items to process.`);
-
-    // Flatten all tasks into a single array
-    const allTasks = [];
-    for (const item of items) {
-        if (prompts.prompt1) allTasks.push({ item, variantNum: 1, promptText: prompts.prompt1 });
-        if (prompts.prompt2) allTasks.push({ item, variantNum: 2, promptText: prompts.prompt2 });
-        if (prompts.prompt3) allTasks.push({ item, variantNum: 3, promptText: prompts.prompt3 });
-    }
-
-    console.log(`Total tasks to process: ${allTasks.length}`);
-
-    // Process tasks in chunks of 1 with 10s delay
-    const CHUNK_SIZE = 1;
-    const DELAY_MS = 10000; // 10 seconds
-
-    try {
-        for (let i = 0; i < allTasks.length; i += CHUNK_SIZE) {
-            const chunk = allTasks.slice(i, i + CHUNK_SIZE);
-            console.log(`Processing chunk ${Math.ceil((i + 1) / CHUNK_SIZE)}/${Math.ceil(allTasks.length / CHUNK_SIZE)} (${chunk.length} tasks)...`);
-
-            // Run chunk in parallel
-            await Promise.all(chunk.map(task => generateVariantWithRetry(task.item, task.variantNum, task.promptText)));
-
-            // Wait 30 seconds if there are more tasks remaining
-            if (i + CHUNK_SIZE < allTasks.length) {
-                console.log(`Waiting ${DELAY_MS / 1000} seconds before next chunk...`);
-                await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-            }
-        }
-    } catch (err) {
-        if (err instanceof CriticalError) {
-            console.error(`CRITICAL: Batch ${batchId} aborted due to repeated failures.`);
-        } else {
-            console.error("Unexpected error in batch processing:", err);
-        }
-    }
-
-    console.log(`Batch ${batchId} processing execution finished.`);
 }
-
-// Helper processItem removed as we process by individual tasks now
 
 async function generateVariantWithRetry(item, variantNum, promptText) {
     const statusField = `status${variantNum}`;
@@ -82,8 +40,7 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
     const safeProductId = (item.product_id || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '');
     const uniqueName = `${safeProductId}-${variantNum}`;
 
-    // Update status to PROCESSING and save the intended path immediately (or on success? User said "save that")
-    // Let's save it immediately so we have a record of what was sent.
+    // Update status to PROCESSING and save the intended path immediately
     await supabase.from('product_generations').update({
         [statusField]: 'PROCESSING',
         [pathField]: uniqueName
@@ -99,7 +56,6 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
             // If we get here, it succeeded
             await supabase.from('product_generations').update({
                 [statusField]: 'COMPLETED'
-                // Path is already saved above
             }).eq('id', item.id);
 
             return; // Exit function on success
@@ -113,15 +69,13 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
                     [statusField]: 'FAILED',
                     [errorField]: `Failed after ${MAX_RETRIES} attempts: ${err.message}`
                 }).eq('id', item.id);
-
-                // STOP ALL OPERATION - CHANGED: Continue to next request
-                console.error(`Failed ${item.product_id} after ${MAX_RETRIES} retries. Moving to next request.`);
-                return; // Exit function, allowing processBatch to continue
+                // Return to allow next item to proceed
+                return;
             }
 
-            // Wait before retry (exponential backoff or fixed?)
-            // Let's do a meaningful delay like 2 seconds.
-            await new Promise(r => setTimeout(r, 2000));
+            // SMART BACKOFF: If error, wait 60 seconds (likely quota issue)
+            console.log(`Hit error. Waiting 60 seconds to cool down before retry...`);
+            await new Promise(r => setTimeout(r, 60000));
         }
     }
 }
@@ -129,7 +83,7 @@ async function generateVariantWithRetry(item, variantNum, promptText) {
 async function makeApiCall(item, promptText, variantNum, uniqueName) {
     const payload = {
         image: item.image_link,
-        ProductName: uniqueName, // Sending unique path as ProductName as requested
+        ProductName: uniqueName, // Sending unique path as ProductName
         prompt: promptText,
         timestamp: uniqueName
     };
@@ -144,4 +98,4 @@ async function makeApiCall(item, promptText, variantNum, uniqueName) {
     }
 }
 
-module.exports = { processBatch };
+module.exports = { processProductItem };

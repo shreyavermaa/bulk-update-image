@@ -114,6 +114,82 @@ app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
     }
 });
 
+
+// NEW ROUTE: Process Single Item (Browser Driven)
+const { processProductItem } = require('./queue');
+
+app.post('/api/process-item', async (req, res) => {
+    try {
+        const { batchId, csvRowNumber, productData, prompts } = req.body;
+        // productData = { Product_ID, Image_Link, ... }
+
+        // Sanitize
+        const productId = productData.Product_ID || productData.product_id || productData.id || 'unknown';
+        const imageLink = productData.Image_Link || productData.image_link || productData.image || '';
+
+        // Check if already exists? Or just insert.
+        // Let's insert blindly. Unique constraint (batch_id, product_id) usually prevents dups but we might not have it.
+        // Or update if exists?
+
+        let itemData;
+
+        // Try to select existing first to avoid duplicates if re-run
+        const { data: existing } = await supabase
+            .from('product_generations')
+            .select('*')
+            .eq('batch_id', batchId)
+            .eq('product_id', productId)
+            .maybeSingle();
+
+        if (existing) {
+            itemData = existing;
+            // Maybe it failed before? Reset prompts?
+            // Actually, if it's already COMPLETED, maybe skip?
+            // But user might want to re-run.
+            // Let's assume re-run.
+        } else {
+            // Insert new
+            const { data: inserted, error: insertError } = await supabase
+                .from('product_generations')
+                .insert([{
+                    batch_id: batchId,
+                    csv_name: 'browser_upload',
+                    csv_row_number: csvRowNumber,
+                    product_id: productId,
+                    image_link: imageLink,
+                    prompt1: prompts.prompt1,
+                    prompt2: prompts.prompt2,
+                    prompt3: prompts.prompt3,
+                    status1: prompts.prompt1 ? 'PENDING' : 'SKIPPED',
+                    status2: prompts.prompt2 ? 'PENDING' : 'SKIPPED',
+                    status3: prompts.prompt3 ? 'PENDING' : 'SKIPPED'
+                }])
+                .select()
+                .single();
+
+            if (insertError) throw insertError;
+            itemData = inserted;
+        }
+
+        console.log(`Processing single item ${productId} for batch ${batchId}...`);
+
+        // This will wait until all 3 prompts are done (or failed)
+        await processProductItem(itemData, prompts);
+
+        res.json({ success: true, productId });
+
+    } catch (err) {
+        console.error('Single item process error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Also need a route to get a new Batch ID for the browser
+app.get('/api/new-batch-id', async (req, res) => {
+    const id = await getNextBatchId();
+    res.json({ batchId: id });
+});
+
 // Route to get batch status
 app.get('/api/batch-status/:batchId', async (req, res) => {
     const { batchId } = req.params;
@@ -283,6 +359,55 @@ app.get('/api/download-images/:batchId', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
+
+    // AUTO-RESUME LOGIC
+    // Check for any items that were PENDING or PROCESSING when the server stopped/restarted
+    try {
+        console.log('Checking for pending/interrupted jobs...');
+        const { data: pendingItems, error } = await supabase
+            .from('product_generations')
+            .select('*')
+            .or('status1.in.(PENDING,PROCESSING),status2.in.(PENDING,PROCESSING),status3.in.(PENDING,PROCESSING)')
+            .order('created_at', { ascending: true });
+
+        if (error) {
+            console.error('Error fetching pending jobs:', error);
+        } else if (pendingItems && pendingItems.length > 0) {
+            console.log(`Found ${pendingItems.length} interrupted items. Resuming...`);
+
+            // Group by BatchID to process efficiently
+            const batches = {};
+            pendingItems.forEach(item => {
+                const bId = item.batch_id;
+                if (!batches[bId]) {
+                    batches[bId] = {
+                        items: [],
+                        prompts: {
+                            prompt1: item.prompt1,
+                            prompt2: item.prompt2,
+                            prompt3: item.prompt3
+                        }
+                    };
+                }
+                batches[bId].items.push(item);
+            });
+
+            // Trigger processBatch for each found batch
+            // Note: processBatch fetches items by ID from DB, so we just need to trigger it.
+            // But processBatch expects (batchId, prompts).
+            // We need to ensure we pass the correct prompts. 
+            // The prompts are stored in the row, so we can extract them from the first item of the batch.
+
+            for (const [bId, batchData] of Object.entries(batches)) {
+                console.log(`Resuming batch ${bId}...`);
+                processBatch(bId, batchData.prompts);
+            }
+        } else {
+            console.log('No pending jobs found.');
+        }
+    } catch (err) {
+        console.error('Auto-resume failed:', err);
+    }
 });
