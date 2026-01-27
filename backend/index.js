@@ -7,7 +7,7 @@ const path = require('path');
 const { Parser } = require('json2csv');
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('./supabaseClient');
-const supabase = require('./supabaseClient');
+
 
 require('dotenv').config();
 
