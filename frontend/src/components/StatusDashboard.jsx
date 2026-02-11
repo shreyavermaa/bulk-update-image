@@ -8,18 +8,32 @@ const StatusDashboard = ({ batchId }) => {
     useEffect(() => {
         if (!batchId) return;
 
+        let stopped = false;
+
         const fetchStatus = async () => {
             try {
                 const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
                 const res = await axios.get(`${backendUrl}/api/batch-status/${batchId}`);
                 setItems(res.data);
+
+                // Auto-stop polling when all items are in a terminal state
+                const terminalStates = ['COMPLETED', 'FAILED', 'SKIPPED'];
+                const allDone = res.data.length > 0 && res.data.every(item =>
+                    [1, 2, 3].every(v => terminalStates.includes(item[`status${v}`]))
+                );
+                if (allDone) {
+                    stopped = true;
+                    clearInterval(interval);
+                }
             } catch (err) {
                 console.error('Polling error', err);
             }
         };
 
         fetchStatus();
-        const interval = setInterval(fetchStatus, 3000); // Poll every 3 seconds
+        const interval = setInterval(() => {
+            if (!stopped) fetchStatus();
+        }, 3000);
 
         return () => clearInterval(interval);
     }, [batchId]);

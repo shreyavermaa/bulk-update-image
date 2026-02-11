@@ -83,29 +83,9 @@ app.post('/api/initiate-batch', upload.single('file'), async (req, res) => {
                     prompt3: prompt3,
                     status1: prompt1 ? 'PENDING' : 'SKIPPED',
                     status2: prompt2 ? 'PENDING' : 'SKIPPED',
-                    status3: prompts ? 'PENDING' : 'SKIPPED' // Fix typo in original: prompt3 was checked via closure? No, prompts variable? 
-                    // Wait, original code used: status3: prompt3 ? ...
-                    // In this function scope, prompt3 IS defined.
-                    // But I need to allow prompts.
-                }));
-                // Wait, map is cleaner.
-
-                // Correction for map above to keep it simple and correct:
-                /*
-                const rowsToInsert = results.map((row, index) => ({
-                    batch_id: batchId,
-                    csv_name: file.originalname,
-                    csv_row_number: index + 1,
-                    product_id: row.Product_ID || row.product_id || row.id || 'unknown',
-                    image_link: row.Image_Link || row.image_link || row.image || '',
-                    prompt1: prompt1,
-                    prompt2: prompt2,
-                    prompt3: prompt3,
-                    status1: prompt1 ? 'PENDING' : 'SKIPPED',
-                    status2: prompt2 ? 'PENDING' : 'SKIPPED',
                     status3: prompt3 ? 'PENDING' : 'SKIPPED'
                 }));
-                */
+
 
                 if (rowsToInsert.length === 0) {
                     return res.status(400).json({ error: 'CSV is empty or could not be parsed' });
@@ -147,58 +127,43 @@ app.get('/api/new-batch-id', async (req, res) => {
 app.post('/api/db/start-item', async (req, res) => {
     try {
         const { batchId, csvRowNumber, productData, prompts, uniqueName, variantNum } = req.body;
-        // productData = { Product_ID, Image_Link, ... }
-
         const productId = productData.Product_ID || productData.product_id || productData.id || 'unknown';
         const imageLink = productData.Image_Link || productData.image_link || productData.image || '';
 
-        // Upsert logic: ensure row exists
-        // We use upsert on (batch_id, product_id) usually, but here we might just insert if not exists.
-        // Simplified: Check if exists, if not insert. Then update status.
-
-        // 1. Ensure Row Exists
-        let { data: row, error: fetchError } = await supabase
-            .from('product_generations')
-            .select('id')
-            .eq('batch_id', batchId)
-            .eq('product_id', productId)
-            .maybeSingle();
-
-        if (!row) {
-            const { data: inserted, error: insertError } = await supabase
-                .from('product_generations')
-                .insert([{
-                    batch_id: batchId,
-                    csv_name: 'browser_upload',
-                    csv_row_number: csvRowNumber,
-                    product_id: productId,
-                    image_link: imageLink,
-                    prompt1: prompts.prompt1,
-                    prompt2: prompts.prompt2,
-                    prompt3: prompts.prompt3,
-                    status1: prompts.prompt1 ? 'PENDING' : 'SKIPPED',
-                    status2: prompts.prompt2 ? 'PENDING' : 'SKIPPED',
-                    status3: prompts.prompt3 ? 'PENDING' : 'SKIPPED'
-                }])
-                .select()
-                .single();
-            if (insertError) throw insertError;
-            row = inserted;
-        }
-
-        // 2. Update Status to PROCESSING
         const statusField = `status${variantNum}`;
         const pathField = `image${variantNum}_path`;
 
-        const { error: updateError } = await supabase
-            .from('product_generations')
-            .update({
-                [statusField]: 'PROCESSING',
-                [pathField]: uniqueName
-            })
-            .eq('id', row.id);
+        // OPTIMIZED: Single UPSERT instead of SELECT-INSERT-UPDATE (3 DB calls → 1)
+        const upsertData = {
+            batch_id: batchId,
+            product_id: productId,
+            csv_name: 'browser_upload',
+            csv_row_number: csvRowNumber,
+            image_link: imageLink,
+            prompt1: prompts.prompt1,
+            prompt2: prompts.prompt2,
+            prompt3: prompts.prompt3,
+            [statusField]: 'PROCESSING',
+            [pathField]: uniqueName
+        };
 
-        if (updateError) throw updateError;
+        // Only set initial status fields on first insert (variant 1)
+        if (variantNum === 1) {
+            upsertData.status1 = 'PROCESSING';
+            upsertData.status2 = prompts.prompt2 ? 'PENDING' : 'SKIPPED';
+            upsertData.status3 = prompts.prompt3 ? 'PENDING' : 'SKIPPED';
+        }
+
+        const { data: row, error } = await supabase
+            .from('product_generations')
+            .upsert(upsertData, {
+                onConflict: 'batch_id,product_id',
+                ignoreDuplicates: false
+            })
+            .select('id')
+            .single();
+
+        if (error) throw error;
 
         res.json({ success: true, id: row.id });
     } catch (err) {
@@ -271,27 +236,24 @@ app.get('/api/batch-status/:batchId', async (req, res) => {
 // Route to get list of all batches
 app.get('/api/batches', async (req, res) => {
     try {
-        // Fetch minimal info to list batches. 
-        // Note: For large datasets, a dedicated "batches" table or SQL View/RPC is better.
+        // OPTIMIZED: fetch only distinct batch_ids with limit
         const { data, error } = await supabase
             .from('product_generations')
             .select('batch_id, csv_name, created_at')
-            .order('created_at', { ascending: false });
+            .order('created_at', { ascending: false })
+            .limit(200); // Cap to prevent fetching thousands of rows
 
         if (error) {
             console.error('Error fetching batches:', error);
             return res.status(500).json({ error: 'Failed to fetch batches' });
         }
 
-        // Deduplicate by batch_id
-        const uniqueBatches = [];
-        const seenBatches = new Set();
-
-        data.forEach(item => {
-            if (!seenBatches.has(item.batch_id)) {
-                seenBatches.add(item.batch_id);
-                uniqueBatches.push(item);
-            }
+        // Deduplicate by batch_id (fast with Set)
+        const seen = new Set();
+        const uniqueBatches = data.filter(item => {
+            if (seen.has(item.batch_id)) return false;
+            seen.add(item.batch_id);
+            return true;
         });
 
         res.json(uniqueBatches);

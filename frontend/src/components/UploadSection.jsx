@@ -4,6 +4,11 @@ import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
 import Papa from 'papaparse';
 
+// Constants — read once, not on every loop iteration
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+const N8N_URL = 'https://n8n.srv1163673.hstgr.cloud/webhook/image-variant';
+const MAX_RETRIES_PER_ITEM = 3;
+
 const UploadSection = ({ onBatchStarted }) => {
     // Mode: 'config' | 'processing' | 'done'
     const [mode, setMode] = useState('config');
@@ -18,7 +23,6 @@ const UploadSection = ({ onBatchStarted }) => {
     const [currentIndex, setCurrentIndex] = useState(0);
     const [stats, setStats] = useState({ success: 0, failed: 0, skipped: 0 });
     const [logs, setLogs] = useState([]);
-    const [isPaused, setIsPaused] = useState(false);
     const [waitTimer, setWaitTimer] = useState(0);
     const [activeItem, setActiveItem] = useState(null); // { id: '...', variant: 1 }
 
@@ -82,20 +86,29 @@ const UploadSection = ({ onBatchStarted }) => {
                     alert('CSV is empty');
                     return;
                 }
-                setCsvData(results.data);
+
+                // Sanitize CSV data: trim whitespace from Product_ID and Image_Link
+                const sanitizedData = results.data.map(row => ({
+                    ...row,
+                    Product_ID: (row.Product_ID || row.product_id || '').trim(),
+                    product_id: (row.Product_ID || row.product_id || '').trim(),
+                    Image_Link: (row.Image_Link || row.image_link || '').trim(),
+                    image_link: (row.Image_Link || row.image_link || '').trim()
+                }));
+
+                setCsvData(sanitizedData);
 
                 // 2. Get Batch ID
                 try {
-                    const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-                    const res = await axios.get(`${backendUrl}/api/new-batch-id`);
+                    const res = await axios.get(`${BACKEND_URL}/api/new-batch-id`);
                     const newBatchId = res.data.batchId;
                     setBatchId(newBatchId);
                     setMode('processing');
                     addLog(`Initialized Batch: ${newBatchId}`);
-                    addLog(`Loaded ${results.data.length} items from CSV`);
+                    addLog(`Loaded ${sanitizedData.length} items from CSV`);
 
                     // Start Loop
-                    processLoop(results.data, newBatchId, 0);
+                    processLoop(sanitizedData, newBatchId, 0);
 
                 } catch (err) {
                     console.error(err);
@@ -108,27 +121,19 @@ const UploadSection = ({ onBatchStarted }) => {
         });
     };
 
-    const processLoop = async (data, bId, index) => {
+    const processLoop = async (data, bId, index, retryCount = 0) => {
         if (index >= data.length) {
             setMode('done');
             setActiveItem(null);
-            addLog('All items command completed.');
+            addLog('All items completed.');
             if (onBatchStarted) onBatchStarted(bId);
-            return;
-        }
-
-        if (isPaused) {
-            addLog('Paused. Waiting to resume...');
             return;
         }
 
         const item = data[index];
         setCurrentIndex(index);
-        // addLog(`Processing item ${index + 1}/${data.length}: ${item.Product_ID || 'Unknown Type'}`);
 
         try {
-            const backendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
-            const n8nUrl = 'https://n8n.srv1163673.hstgr.cloud/webhook/image-variant'; // Hardcoded for now
 
             // Function to process a single prompt variant
             const processVariant = async (variantNum, promptText) => {
@@ -141,7 +146,7 @@ const UploadSection = ({ onBatchStarted }) => {
                 addLog(`[${safeProductId}] Starting Var ${variantNum}...`);
 
                 // 1. Log START to Backend
-                await axios.post(`${backendUrl}/api/db/start-item`, {
+                await axios.post(`${BACKEND_URL}/api/db/start-item`, {
                     batchId: bId,
                     csvRowNumber: index + 1,
                     productData: item,
@@ -162,47 +167,117 @@ const UploadSection = ({ onBatchStarted }) => {
 
                 setActiveItem({ id: safeProductId, variant: variantNum, status: 'SENDING TO AI' });
                 addLog(`[${safeProductId}] Sending to n8n...`);
-                const n8nRes = await axios.post(n8nUrl, payload);
+                const n8nRes = await axios.post(N8N_URL, payload);
 
-                if (n8nRes.data && n8nRes.data.success) {
-                    // 3. Log COMPLETE to Backend
+                // Log response for debugging
+                addLog(`[${safeProductId}] n8n status: ${n8nRes.status}, data: ${JSON.stringify(n8nRes.data || {}).slice(0, 100)}`);
+
+                // Accept any 2xx status code as success (standard HTTP practice)
+                if (n8nRes.status >= 200 && n8nRes.status < 300) {
+                    // 3. Log COMPLETE to Backend with retry logic
                     setActiveItem({ id: safeProductId, variant: variantNum, status: 'SAVING' });
-                    await axios.post(`${backendUrl}/api/db/complete-item`, {
-                        batchId: bId,
-                        productId: safeProductId, // backend expects product_id used in DB
-                        variantNum: variantNum
-                    });
-                    addLog(`[${safeProductId}] Var ${variantNum} COMPLETED.`);
+
+                    // CRITICAL FIX: Retry complete-item up to 3 times with exponential backoff
+                    // This prevents items from getting stuck in PROCESSING if backend is temporarily down
+                    let completeSaved = false;
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        try {
+                            await axios.post(`${BACKEND_URL}/api/db/complete-item`, {
+                                batchId: bId,
+                                productId: safeProductId,
+                                variantNum: variantNum
+                            });
+                            completeSaved = true;
+                            addLog(`[${safeProductId}] Var ${variantNum} COMPLETED.`);
+                            break; // Success - exit retry loop
+                        } catch (completeErr) {
+                            addLog(`[${safeProductId}] complete-item attempt ${attempt}/3 failed: ${completeErr.message}`);
+
+                            if (attempt === 3) {
+                                // After 3 failed attempts, mark as FAILED instead of leaving as PROCESSING
+                                try {
+                                    await axios.post(`${BACKEND_URL}/api/db/fail-item`, {
+                                        batchId: bId,
+                                        productId: safeProductId,
+                                        variantNum: variantNum,
+                                        errorMessage: `complete-item failed after 3 attempts: ${completeErr.message}`
+                                    });
+                                    addLog(`[${safeProductId}] Var ${variantNum} marked as FAILED (complete-item unreachable).`);
+                                } catch (failErr) {
+                                    addLog(`[${safeProductId}] ERROR: Could not mark as FAILED either: ${failErr.message}`);
+                                }
+                            } else {
+                                // Exponential backoff: 1s, 2s
+                                await new Promise(r => setTimeout(r, 1000 * attempt));
+                            }
+                        }
+                    }
+
+                    if (!completeSaved) {
+                        throw new Error('Failed to save completion status after 3 attempts');
+                    }
                 } else {
-                    throw new Error(`n8n response not success: ${JSON.stringify(n8nRes.data)}`);
+                    throw new Error(`n8n returned status ${n8nRes.status}`);
                 }
             };
 
-            // Run variants sequentially
-            if (prompts.prompt1) await processVariant(1, prompts.prompt1);
-            if (prompts.prompt2) await processVariant(2, prompts.prompt2);
-            if (prompts.prompt3) await processVariant(3, prompts.prompt3);
+            // Run variants sequentially with 60s delay between each
+            if (prompts.prompt1) {
+                await processVariant(1, prompts.prompt1);
+                addLog(`Var 1 Done. Cooling down for 60s...`);
+                await waitWithCountdown(60);
+            }
+            if (prompts.prompt2) {
+                await processVariant(2, prompts.prompt2);
+                addLog(`Var 2 Done. Cooling down for 60s...`);
+                await waitWithCountdown(60);
+            }
+            if (prompts.prompt3) {
+                await processVariant(3, prompts.prompt3);
+                addLog(`Var 3 Done. Cooling down for 60s...`);
+                await waitWithCountdown(60);
+            }
 
             setStats(prev => ({ ...prev, success: prev.success + 1 }));
             setActiveItem(null);
 
-            // Standard Delay 60s for EACH request as requested
-            addLog(`Item Done. Cooling down for 60s...`);
-            await waitWithCountdown(60);
+            // Move to next item (no extra delay needed, already waited after each variant)
+            addLog(`Item ${index + 1} complete. Moving to next...`);
             processLoop(data, bId, index + 1);
 
         } catch (err) {
             console.error(err);
-            setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
-
             const errMsg = err.response ? `API Error ${err.response.status}` : err.message;
-            addLog(`Error: ${errMsg}. Waiting 60s to retry...`);
-            setActiveItem({ id: 'ERROR', variant: '-', status: 'RETRYING' });
 
-            // Error Delay (Smart Backoff)
-            await waitWithCountdown(60);
-            addLog(`Retrying item ${index + 1}...`);
-            processLoop(data, bId, index);
+            if (retryCount < MAX_RETRIES_PER_ITEM - 1) {
+                // Retry with backoff
+                setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+                addLog(`Error: ${errMsg}. Retry ${retryCount + 1}/${MAX_RETRIES_PER_ITEM}. Waiting 60s...`);
+                setActiveItem({ id: 'ERROR', variant: '-', status: `RETRY ${retryCount + 1}/${MAX_RETRIES_PER_ITEM}` });
+                await waitWithCountdown(60);
+                processLoop(data, bId, index, retryCount + 1);
+            } else {
+                // Max retries reached — mark as FAILED and skip to next item
+                addLog(`SKIPPING item ${index + 1} after ${MAX_RETRIES_PER_ITEM} failed attempts: ${errMsg}`);
+                setStats(prev => ({ ...prev, failed: prev.failed + 1 }));
+
+                // Try to mark all variants as FAILED in DB
+                const safeProductId = (item.Product_ID || item.product_id || item.id || 'unknown').replace(/[^a-zA-Z0-9-_]/g, '');
+                try {
+                    for (let v = 1; v <= 3; v++) {
+                        await axios.post(`${BACKEND_URL}/api/db/fail-item`, {
+                            batchId: bId,
+                            productId: safeProductId,
+                            variantNum: v,
+                            errorMessage: `Skipped after ${MAX_RETRIES_PER_ITEM} retries: ${errMsg}`
+                        }).catch(() => { }); // Best effort
+                    }
+                } catch (e) { /* best effort */ }
+
+                setActiveItem(null);
+                await waitWithCountdown(10); // Short pause before next item
+                processLoop(data, bId, index + 1, 0); // Next item, reset retry counter
+            }
         }
     };
 
