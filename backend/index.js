@@ -133,37 +133,46 @@ app.post('/api/db/start-item', async (req, res) => {
         const statusField = `status${variantNum}`;
         const pathField = `image${variantNum}_path`;
 
-        // OPTIMIZED: Single UPSERT instead of SELECT-INSERT-UPDATE (3 DB calls → 1)
-        const upsertData = {
-            batch_id: batchId,
-            product_id: productId,
-            csv_name: 'browser_upload',
-            csv_row_number: csvRowNumber,
-            image_link: imageLink,
-            prompt1: prompts.prompt1,
-            prompt2: prompts.prompt2,
-            prompt3: prompts.prompt3,
-            [statusField]: 'PROCESSING',
-            [pathField]: uniqueName
-        };
-
-        // Only set initial status fields on first insert (variant 1)
-        if (variantNum === 1) {
-            upsertData.status1 = 'PROCESSING';
-            upsertData.status2 = prompts.prompt2 ? 'PENDING' : 'SKIPPED';
-            upsertData.status3 = prompts.prompt3 ? 'PENDING' : 'SKIPPED';
-        }
-
-        const { data: row, error } = await supabase
+        // Check if row exists
+        let { data: row } = await supabase
             .from('product_generations')
-            .upsert(upsertData, {
-                onConflict: 'batch_id,product_id',
-                ignoreDuplicates: false
-            })
             .select('id')
-            .single();
+            .eq('batch_id', batchId)
+            .eq('product_id', productId)
+            .maybeSingle();
 
-        if (error) throw error;
+        if (!row) {
+            // INSERT new row with all fields
+            const insertData = {
+                batch_id: batchId,
+                csv_name: 'browser_upload',
+                csv_row_number: csvRowNumber,
+                product_id: productId,
+                image_link: imageLink,
+                prompt1: prompts.prompt1,
+                prompt2: prompts.prompt2,
+                prompt3: prompts.prompt3,
+                status1: variantNum === 1 ? 'PROCESSING' : (prompts.prompt1 ? 'PENDING' : 'SKIPPED'),
+                status2: variantNum === 2 ? 'PROCESSING' : (prompts.prompt2 ? 'PENDING' : 'SKIPPED'),
+                status3: variantNum === 3 ? 'PROCESSING' : (prompts.prompt3 ? 'PENDING' : 'SKIPPED'),
+                [pathField]: uniqueName
+            };
+
+            const { data: inserted, error: insertError } = await supabase
+                .from('product_generations')
+                .insert([insertData])
+                .select('id')
+                .single();
+            if (insertError) throw insertError;
+            row = inserted;
+        } else {
+            // UPDATE only the status and path for this variant
+            const { error: updateError } = await supabase
+                .from('product_generations')
+                .update({ [statusField]: 'PROCESSING', [pathField]: uniqueName })
+                .eq('id', row.id);
+            if (updateError) throw updateError;
+        }
 
         res.json({ success: true, id: row.id });
     } catch (err) {
